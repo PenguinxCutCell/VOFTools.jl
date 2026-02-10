@@ -1,0 +1,35 @@
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+
+# Julia
+.julia/
+.julia_history
+*.jl.cov
+
+# Build / compiled artifacts
+*.o
+*.so
+*.dylib
+*.a
+
+# Package artifacts and temporary files
+artifacts/
+deps/
+.tmp/
+
+# Coverage and test artifacts
+coverage/
+coverage.*
+
+# Logs
+*.log
+
+# Julia
+Manifest.toml
