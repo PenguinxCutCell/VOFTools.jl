@@ -36,6 +36,11 @@ println("cube volume = ", vol)
 - This package is a direct translation of the VOFTools Fortran implementation.
 - See `src/meshes3d.jl` and `src/meshes2d.jl` for many provided test meshes.
 
+## Performance
+
+By using task-local workspaces and preallocating necessary arrays, this implementation minimizes memory allocations and optimizes performance.
+Allocations free and fast execution times are expected for the provided benchmark cases (see `benchmark/profile_case.jl`).
+
 ## License and credits
 
 All credits go to the original authors of VOFTools (J. Lopez, J. Hernandez, and collaborators).

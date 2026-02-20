@@ -109,25 +109,19 @@ Modifies `ntp0`, `nts0`, `ntv0` (all `Ref{Int}`).
 Uses the v5 edge-tracking algorithm that supports multiple new faces
 (disjoint truncation regions in non-convex polyhedra).
 """
-function newpol3d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
-                   ipv0::Matrix{Int}, iscut::Vector{Int},
-                   nipv0::Vector{Int}, ntp0::Ref{Int}, nts0::Ref{Int},
-                   ntv0::Ref{Int}, xnc::Float64, xns0::Vector{Float64},
-                   ync::Float64, yns0::Vector{Float64},
-                   znc::Float64, zns0::Vector{Float64})
+function _newpol3d_impl!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
+                         ipv0::Matrix{Int}, iscut::Vector{Int},
+                         nipv0::Vector{Int}, ntp0::Ref{Int}, nts0::Ref{Int},
+                         ntv0::Ref{Int}, xnc::Float64, xns0::Vector{Float64},
+                         ync::Float64, yns0::Vector{Float64},
+                         znc::Float64, zns0::Vector{Float64},
+                         ipv1::Matrix{Int}, nipv1::Vector{Int}, nedge::Vector{Int},
+                         ise::Matrix{Int}, ivise::Matrix{Int},
+                         ipise::Matrix{Int}, ipmark::Vector{Int})
     nv_max = size(ipv0, 2)
-    ns_max = size(ipv0, 1)
-
-    # Work arrays
-    ipv1  = zeros(Int, ns_max, nv_max)
-    nipv1 = zeros(Int, ns_max)
-    nedge = zeros(Int, ns_max)
-
-    # Edge-tracking arrays (v5)
-    ise    = zeros(Int, ns_max, nv_max)   # ISE(IS,IE): new vertex index for IE-th cut edge of face IS
-    ivise  = zeros(Int, ns_max, nv_max)   # IVISE(IS,IPNEW): local vertex index of IPNEW in face IS
-    ipise  = zeros(Int, nv_max, 2)        # IPISE(IPNEW,ITYPE): face index for new vertex IPNEW
-    ipmark = zeros(Int, nv_max)           # IPMARK(IPNEW): whether vertex has been visited
+    fill!(nipv1, 0)
+    fill!(nedge, 0)
+    fill!(ipmark, 0)
 
     # Determination of the cut faces
     isini = 0
@@ -311,6 +305,77 @@ function newpol3d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
     return
 end
 
+function newpol3d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
+                   ipv0::Matrix{Int}, iscut::Vector{Int},
+                   nipv0::Vector{Int}, ntp0::Ref{Int}, nts0::Ref{Int},
+                   ntv0::Ref{Int}, xnc::Float64, xns0::Vector{Float64},
+                   ync::Float64, yns0::Vector{Float64},
+                   znc::Float64, zns0::Vector{Float64})
+    ns_max = size(ipv0, 1)
+    nv_max = size(ipv0, 2)
+    ipv1 = zeros(Int, ns_max, nv_max)
+    nipv1 = zeros(Int, ns_max)
+    nedge = zeros(Int, ns_max)
+    ise = zeros(Int, ns_max, nv_max)
+    ivise = zeros(Int, ns_max, nv_max)
+    ipise = zeros(Int, nv_max, 2)
+    ipmark = zeros(Int, nv_max)
+    return _newpol3d_impl!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp0, nts0, ntv0,
+                           xnc, xns0, ync, yns0, znc, zns0,
+                           ipv1, nipv1, nedge, ise, ivise, ipise, ipmark)
+end
+
+# Reusable task-local workspace for inte3d! hot path.
+mutable struct _Inte3DWork
+    ia::Vector{Int}
+    phiv::Vector{Float64}
+    iscut::Vector{Int}
+    ipia0::Vector{Int}
+    ipia1::Vector{Int}
+    ntp_ref::Base.RefValue{Int}
+    nts_ref::Base.RefValue{Int}
+    ntv_ref::Base.RefValue{Int}
+    ipv1::Matrix{Int}
+    nipv1::Vector{Int}
+    nedge::Vector{Int}
+    ise::Matrix{Int}
+    ivise::Matrix{Int}
+    ipise::Matrix{Int}
+    ipmark::Vector{Int}
+end
+
+function _Inte3DWork(poly::Polyhedron3D)
+    ns_max = size(poly.ipv, 1)
+    nv_max = size(poly.ipv, 2)
+    nv_store = size(poly.vertp, 1)
+    return _Inte3DWork(
+        zeros(Int, nv_store),
+        zeros(nv_store),
+        zeros(Int, ns_max),
+        zeros(Int, nv_max),
+        zeros(Int, nv_max),
+        Ref(0), Ref(0), Ref(0),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, nv_max, 2),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_inte3d_work(poly::Polyhedron3D)
+    key = (size(poly.ipv, 1), size(poly.ipv, 2), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_inte3d_work) do
+        Dict{NTuple{3, Int}, _Inte3DWork}()
+    end::Dict{NTuple{3, Int}, _Inte3DWork}
+    return get!(cache, key) do
+        _Inte3DWork(poly)
+    end::_Inte3DWork
+end
+
 # ============================= INTE3D ======================================
 """
     inte3d!(poly::Polyhedron3D, c, xnc, ync, znc) -> (icontn, icontp)
@@ -329,15 +394,29 @@ function inte3d!(poly::Polyhedron3D, c::Float64,
     nts0  = poly.nts
     ntp0  = poly.ntp
     ntv0  = poly.ntv
-    nv_max = size(ipv0, 2)
+    work = _get_inte3d_work(poly)::_Inte3DWork
+    ia = work.ia
+    phiv = work.phiv
+    iscut = work.iscut
+    ipia0 = work.ipia0
+    ipia1 = work.ipia1
+    ntp_ref = work.ntp_ref
+    nts_ref = work.nts_ref
+    ntv_ref = work.ntv_ref
+    ipv1 = work.ipv1
+    nipv1 = work.nipv1
+    nedge = work.nedge
+    ise = work.ise
+    ivise = work.ivise
+    ipise = work.ipise
+    ipmark = work.ipmark
 
     icontp = 0
     icontn = 0
     sump = 0.0
     sumn = 0.0
 
-    ia   = fill(-1, size(vertp0, 1))
-    phiv = zeros(size(vertp0, 1))
+    fill!(ia, -1)
 
     # Distance function and values of IA
     for is in 1:nts0
@@ -362,15 +441,16 @@ function inte3d!(poly::Polyhedron3D, c::Float64,
     if icontp != 0 && icontn != 0
         # Construction of the new polyhedron
         nts00 = nts0
-        iscut = zeros(Int, size(ipv0, 1))
-        ipia0 = zeros(Int, nv_max)
-        ipia1 = zeros(Int, nv_max)
-        ntp_ref = Ref(ntp0)
-        nts_ref = Ref(nts0)
-        ntv_ref = Ref(ntv0)
+        fill!(iscut, 0)
+        fill!(ipia0, 0)
+        fill!(ipia1, 0)
+        ntp_ref[] = ntp0
+        nts_ref[] = nts0
+        ntv_ref[] = ntv0
 
-        newpol3d!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
-                  ntv_ref, xnc, xns0, ync, yns0, znc, zns0)
+        _newpol3d_impl!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
+                        ntv_ref, xnc, xns0, ync, yns0, znc, zns0,
+                        ipv1, nipv1, nedge, ise, ivise, ipise, ipmark)
 
         nts0 = nts_ref[]
         ntp0 = ntp_ref[]
@@ -830,6 +910,83 @@ function enforv3dsz(dx::Float64, dy::Float64, dz::Float64,
     end
 end
 
+# Reusable task-local workspace for enforv3d! hot path.
+mutable struct _Enforv3DWork
+    poly0::Polyhedron3D
+    poly1::Polyhedron3D
+    cs::Vector{Float64}
+    phiv::Vector{Float64}
+    ia::Vector{Int}
+    listv::Vector{Int}
+    iscut::Vector{Int}
+    ipia0::Vector{Int}
+    ipia1::Vector{Int}
+    ntp_ref::Base.RefValue{Int}
+    nts_ref::Base.RefValue{Int}
+    ntv_ref::Base.RefValue{Int}
+    betxe::Matrix{Float64}
+    betye::Matrix{Float64}
+    betze::Matrix{Float64}
+    x0::Matrix{Float64}
+    y0::Matrix{Float64}
+    z0::Matrix{Float64}
+    sumk::Vector{Float64}
+    suml::Vector{Float64}
+    summ::Vector{Float64}
+    ipv1::Matrix{Int}
+    nipv1::Vector{Int}
+    nedge::Vector{Int}
+    ise::Matrix{Int}
+    ivise::Matrix{Int}
+    ipise::Matrix{Int}
+    ipmark::Vector{Int}
+end
+
+function _Enforv3DWork(poly::Polyhedron3D)
+    ns_max = size(poly.ipv, 1)
+    nv_max = size(poly.ipv, 2)
+    nv_store = size(poly.vertp, 1)
+    return _Enforv3DWork(
+        cppol3d(poly),
+        cppol3d(poly),
+        zeros(ns_max),
+        zeros(nv_store),
+        zeros(Int, nv_store),
+        zeros(Int, nv_store),
+        zeros(Int, ns_max),
+        zeros(Int, nv_max),
+        zeros(Int, nv_max),
+        Ref(0), Ref(0), Ref(0),
+        zeros(ns_max, nv_max),
+        zeros(ns_max, nv_max),
+        zeros(ns_max, nv_max),
+        zeros(ns_max, nv_max),
+        zeros(ns_max, nv_max),
+        zeros(ns_max, nv_max),
+        zeros(ns_max),
+        zeros(ns_max),
+        zeros(ns_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, nv_max, 2),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_enforv3d_work(poly::Polyhedron3D)
+    key = (size(poly.ipv, 1), size(poly.ipv, 2), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_enforv3d_work) do
+        Dict{NTuple{3, Int}, _Enforv3DWork}()
+    end::Dict{NTuple{3, Int}, _Enforv3DWork}
+    return get!(cache, key) do
+        _Enforv3DWork(poly)
+    end::_Enforv3DWork
+end
+
 # ============================= ENFORV3D ====================================
 """
     enforv3d!(poly::Polyhedron3D, v, vt, xnc, ync, znc) -> c
@@ -855,8 +1012,37 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
 
     tolc = 1.0e-12
 
+    work = _get_enforv3d_work(poly)::_Enforv3DWork
+    cs = work.cs
+    phiv = work.phiv
+    ia = work.ia
+    listv = work.listv
+    poly0 = work.poly1
+    iscut = work.iscut
+    ipia0 = work.ipia0
+    ipia1 = work.ipia1
+    ntp_ref = work.ntp_ref
+    nts_ref = work.nts_ref
+    ntv_ref = work.ntv_ref
+    betxe = work.betxe
+    betye = work.betye
+    betze = work.betze
+    x0 = work.x0
+    y0 = work.y0
+    z0 = work.z0
+    sumk = work.sumk
+    suml = work.suml
+    summ = work.summ
+    ipv1 = work.ipv1
+    nipv1 = work.nipv1
+    nedge = work.nedge
+    ise = work.ise
+    ivise = work.ivise
+    ipise = work.ipise
+    ipmark = work.ipmark
+
     # Compute face constants cs
-    cs = zeros(ns_max)
+    fill!(cs, 0.0)
     for is in 1:nts
         ip = ipv[is, 1]
         cs[is] = -(xns[is] * vertp[ip, 1] + yns[is] * vertp[ip, 2] +
@@ -878,13 +1064,14 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
     vaux = v
 
     # Compute phi values and ordered list
-    phiv = zeros(ntp)
     for iv in 1:ntv
         phiv[iv] = xnc * vertp[iv, 1] + ync * vertp[iv, 2] + znc * vertp[iv, 3]
     end
 
-    listv = collect(1:ntp)
-    sort!(listv, by = i -> -phiv[i])  # descending order
+    for iv in 1:ntp
+        listv[iv] = iv
+    end
+    sort!(view(listv, 1:ntp), lt = (i, j) -> phiv[i] > phiv[j])  # descending order
 
     invert = 0
     xncor = xnc; yncor = ync; zncor = znc
@@ -932,7 +1119,7 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
             znc_local = zncor
         end
 
-        ia = zeros(Int, size(vertp, 1))
+        fill!(ia, 0)
         for i in 1:ntp
             if i <= iminl
                 ia[listv[i]] = 1 - invert
@@ -942,21 +1129,21 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
         end
 
         # Copy polyhedron to working copy
-        poly0 = cppol3d(poly)
-        cs0 = copy(cs)
+        cppol3d!(poly0, poly)
         ipv0  = poly0.ipv; nipv0 = poly0.nipv; vertp0 = poly0.vertp
         xns0 = poly0.xns; yns0 = poly0.yns; zns0 = poly0.zns
         nts0 = poly0.nts; ntp0 = poly0.ntp; ntv0 = poly0.ntv
 
         # Construction of the new polyhedron
         nts00 = nts0
-        iscut = zeros(Int, ns_max)
-        ipia0 = zeros(Int, nv_max)
-        ipia1 = zeros(Int, nv_max)
-        ntp_ref = Ref(ntp0); nts_ref = Ref(nts0); ntv_ref = Ref(ntv0)
+        fill!(iscut, 0)
+        fill!(ipia0, 0)
+        fill!(ipia1, 0)
+        ntp_ref[] = ntp0; nts_ref[] = nts0; ntv_ref[] = ntv0
 
-        newpol3d!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
-                  ntv_ref, xnc_local, xns0, ync_local, yns0, znc_local, zns0)
+        _newpol3d_impl!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
+                        ntv_ref, xnc_local, xns0, ync_local, yns0, znc_local, zns0,
+                        ipv1, nipv1, nedge, ise, ivise, ipise, ipmark)
         nts0 = nts_ref[]; ntp0 = ntp_ref[]; ntv0 = ntv_ref[]
 
         if nts0 <= nts00  # disjoint regions may produce this situation
@@ -992,28 +1179,28 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
                     ia[listv[i]] = invert
                 end
             end
-            poly0 = cppol3d(poly)
-            cs0 = copy(cs)
+            cppol3d!(poly0, poly)
             ipv0 = poly0.ipv; nipv0 = poly0.nipv; vertp0 = poly0.vertp
             xns0 = poly0.xns; yns0 = poly0.yns; zns0 = poly0.zns
             nts0 = poly0.nts; ntp0 = poly0.ntp; ntv0 = poly0.ntv
             nts00 = nts0
-            iscut = zeros(Int, ns_max)
-            ipia0 = zeros(Int, nv_max)
-            ipia1 = zeros(Int, nv_max)
-            ntp_ref = Ref(ntp0); nts_ref = Ref(nts0); ntv_ref = Ref(ntv0)
-            newpol3d!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
-                      ntv_ref, xnc_local, xns0, ync_local, yns0, znc_local, zns0)
+            fill!(iscut, 0)
+            fill!(ipia0, 0)
+            fill!(ipia1, 0)
+            ntp_ref[] = ntp0; nts_ref[] = nts0; ntv_ref[] = ntv0
+            _newpol3d_impl!(ia, ipia0, ipia1, ipv0, iscut, nipv0, ntp_ref, nts_ref,
+                            ntv_ref, xnc_local, xns0, ync_local, yns0, znc_local, zns0,
+                            ipv1, nipv1, nedge, ise, ivise, ipise, ipmark)
             nts0 = nts_ref[]; ntp0 = ntp_ref[]; ntv0 = ntv_ref[]
         end
 
         # Contributions of the new faces Γ_c (v5: loop over NTS00+1:NTS0)
-        betxe = zeros(ns_max, nv_max)
-        betye = zeros(ns_max, nv_max)
-        betze = zeros(ns_max, nv_max)
-        x0    = zeros(ns_max, nv_max)
-        y0    = zeros(ns_max, nv_max)
-        z0    = zeros(ns_max, nv_max)
+        fill!(betxe, 0.0)
+        fill!(betye, 0.0)
+        fill!(betze, 0.0)
+        fill!(x0, 0.0)
+        fill!(y0, 0.0)
+        fill!(z0, 0.0)
 
         for is in (nts00+1):nts0
             for iv in 1:nipv0[is]
@@ -1079,9 +1266,9 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
         for is in (nts00+1):nts0
             iscut[is] = 1
         end
-        sumk = zeros(ns_max)
-        suml = zeros(ns_max)
-        summ = zeros(ns_max)
+        fill!(sumk, 0.0)
+        fill!(suml, 0.0)
+        fill!(summ, 0.0)
 
         for is in 1:nts0
             ax = abs(yns0[is]); bx = abs(xns0[is]); cx = abs(zns0[is])
@@ -1181,9 +1368,9 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
         end
         c0 = 6.0 * vaux
         for is in 1:nts00
-            c2_coef += summ[is] * cs0[is]
-            c1_coef += suml[is] * cs0[is]
-            c0 += sumk[is] * cs0[is]
+            c2_coef += summ[is] * cs[is]
+            c1_coef += suml[is] * cs[is]
+            c0 += sumk[is] * cs[is]
         end
 
         vmaxl = vaux - (c3 * cmin_loc^3 + c2_coef * cmin_loc^2 + c1_coef * cmin_loc +
@@ -1231,26 +1418,19 @@ function enforv3d!(poly::Polyhedron3D, v::Float64, vt::Float64,
 
         # Forced adjustment
         if c_ret < cmin2 || c_ret > cmax2
-            # Try cmin2
-            poly_tmp = cppol3d(poly)
-            inte3d!(poly_tmp, cmin2, 0, 0, poly_tmp.ipv, poly_tmp.nipv,
-                    poly_tmp.ntp, poly_tmp.nts, poly_tmp.ntv,
-                    poly_tmp.vertp, xnc_local, poly_tmp.xns,
-                    ync_local, poly_tmp.yns, znc_local, poly_tmp.zns)
-            # Use the wrapper version
-            poly_min = cppol3d(poly)
-            icontn_min, icontp_min = inte3d!(poly_min, cmin2, xnc_local, ync_local, znc_local)
+            cppol3d!(poly0, poly)
+            icontn_min, icontp_min = inte3d!(poly0, cmin2, xnc_local, ync_local, znc_local)
             if icontp_min == 0
                 volmin = 0.0
             else
-                volmin = toolv3d(poly_min)
+                volmin = toolv3d(poly0)
             end
-            poly_max = cppol3d(poly)
-            icontn_max, icontp_max = inte3d!(poly_max, cmax2, xnc_local, ync_local, znc_local)
+            cppol3d!(poly0, poly)
+            icontn_max, icontp_max = inte3d!(poly0, cmax2, xnc_local, ync_local, znc_local)
             if icontp_max == 0
                 volmax = 0.0
             else
-                volmax = toolv3d(poly_max)
+                volmax = toolv3d(poly0)
             end
             if abs(volmin - v) < abs(volmax - v)
                 c_ret = cmin2
@@ -1266,12 +1446,76 @@ end
 """
     enforv3d(poly::Polyhedron3D, v, vt, xnc, ync, znc) -> c
 
-Non-mutating version: copies `poly` first, then solves.
+Non-mutating version: uses a task-local scratch copy, then solves.
 """
 function enforv3d(poly::Polyhedron3D, v::Float64, vt::Float64,
                   xnc::Float64, ync::Float64, znc::Float64)
-    p = cppol3d(poly)
-    return enforv3d!(p, v, vt, xnc, ync, znc)
+    work = _get_enforv3d_work(poly)::_Enforv3DWork
+    cppol3d!(work.poly0, poly)
+    return enforv3d!(work.poly0, v, vt, xnc, ync, znc)
+end
+
+# Reusable task-local workspace for initf3d hot path.
+mutable struct _Initf3DWork
+    icheck::Vector{Int}
+    phiv::Vector{Float64}
+    ia::Vector{Int}
+    poly2::Polyhedron3D
+    poly1::Polyhedron3D
+    poly0::Polyhedron3D
+    icheck_sub::Vector{Int}
+    iscut_sub::Vector{Int}
+    ipia0_sub::Vector{Int}
+    ipia1_sub::Vector{Int}
+    ntp_ref_sub::Base.RefValue{Int}
+    nts_ref_sub::Base.RefValue{Int}
+    ntv_ref_sub::Base.RefValue{Int}
+    ipv1_sub::Matrix{Int}
+    nipv1_sub::Vector{Int}
+    nedge_sub::Vector{Int}
+    ise_sub::Matrix{Int}
+    ivise_sub::Matrix{Int}
+    ipise_sub::Matrix{Int}
+    ipmark_sub::Vector{Int}
+end
+
+function _Initf3DWork(poly::Polyhedron3D)
+    ns_max = size(poly.ipv, 1)
+    nv_max = size(poly.ipv, 2)
+    nv_store = size(poly.vertp, 1)
+    return _Initf3DWork(
+        zeros(Int, nv_store),
+        zeros(nv_store),
+        zeros(Int, nv_store),
+        cppol3d(poly),
+        cppol3d(poly),
+        cppol3d(poly),
+        zeros(Int, nv_store),
+        zeros(Int, ns_max),
+        zeros(Int, nv_max),
+        zeros(Int, nv_max),
+        Ref(0),
+        Ref(0),
+        Ref(0),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, ns_max, nv_max),
+        zeros(Int, nv_max, 2),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_initf3d_work(poly::Polyhedron3D)
+    key = (size(poly.ipv, 1), size(poly.ipv, 2), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_initf3d_work) do
+        Dict{NTuple{3, Int}, _Initf3DWork}()
+    end::Dict{NTuple{3, Int}, _Initf3DWork}
+    return get!(cache, key) do
+        _Initf3DWork(poly)
+    end::_Initf3DWork
 end
 
 # ============================= INITF3D =====================================
@@ -1298,6 +1542,7 @@ function initf3d(func3d::F, poly::Polyhedron3D;
     xns   = poly.xns; yns = poly.yns; zns = poly.zns
     nts   = poly.nts; ntp = poly.ntp; ntv = poly.ntv
     ns_max = size(ipv, 1); nv_max = size(ipv, 2)
+    work = _get_initf3d_work(poly)::_Initf3DWork
 
     # Coordinate extremes and vertex tagging
     xmin = 1.0e20; xmax = -1.0e20
@@ -1305,9 +1550,10 @@ function initf3d(func3d::F, poly::Polyhedron3D;
     zmin = 1.0e20; zmax = -1.0e20
     icontp = 0; icontn = 0
 
-    icheck = zeros(Int, size(vertp, 1))
-    phiv   = zeros(size(vertp, 1))
-    ia     = zeros(Int, size(vertp, 1))
+    icheck = work.icheck
+    phiv = work.phiv
+    ia = work.ia
+    fill!(icheck, 0)
 
     for is in 1:nts
         for iv in 1:nipv[is]
@@ -1354,10 +1600,30 @@ function initf3d(func3d::F, poly::Polyhedron3D;
     ddx = dx / nc; ddy = dy / nc; ddz = dz / nc
 
     vf = 0.0
+    poly2 = work.poly2
+    poly1 = work.poly1
+    poly0 = work.poly0
+    icheck_sub = work.icheck_sub
+
+    iscut_sub = work.iscut_sub
+    ipia0_sub = work.ipia0_sub
+    ipia1_sub = work.ipia1_sub
+    ntp_ref_sub = work.ntp_ref_sub
+    nts_ref_sub = work.nts_ref_sub
+    ntv_ref_sub = work.ntv_ref_sub
+
+    ipv1_sub = work.ipv1_sub
+    nipv1_sub = work.nipv1_sub
+    nedge_sub = work.nedge_sub
+    ise_sub = work.ise_sub
+    ivise_sub = work.ivise_sub
+    ipise_sub = work.ipise_sub
+    ipmark_sub = work.ipmark_sub
+
     for ic in 1:nc
         xc = xmin + (ic - 1) * ddx
-        # Copy polyhedron → poly2
-        poly2 = cppol3d(poly)
+        # Copy polyhedron -> poly2
+        cppol3d!(poly2, poly)
         # Truncate by x-planes
         if ic > 1
             cx1 = -xc
@@ -1368,8 +1634,8 @@ function initf3d(func3d::F, poly::Polyhedron3D;
 
         for jc in 1:nc
             yc = ymin + (jc - 1) * ddy
-            # Copy poly2 → poly1
-            poly1 = cppol3d(poly2)
+            # Copy poly2 -> poly1
+            cppol3d!(poly1, poly2)
             if jc > 1
                 cy1 = -yc
                 icontn_tmp, icontp_tmp = inte3d!(poly1, cy1, 0.0, 1.0, 0.0)
@@ -1380,8 +1646,8 @@ function initf3d(func3d::F, poly::Polyhedron3D;
                 if icontp_tmp2 != 0
                     for kc in 1:nc
                         zc = zmin + (kc - 1) * ddz
-                        # Copy poly1 → poly0
-                        poly0 = cppol3d(poly1)
+                        # Copy poly1 -> poly0
+                        cppol3d!(poly0, poly1)
                         if kc > 1
                             cz1 = -zc
                             icontn_z, icontp_z = inte3d!(poly0, cz1, 0.0, 0.0, 1.0)
@@ -1392,7 +1658,7 @@ function initf3d(func3d::F, poly::Polyhedron3D;
                             if icontp_z2 != 0
                                 # Subcell determination by truncation
                                 icontp_sub = 0; icontn_sub = 0
-                                icheck_sub = zeros(Int, size(poly0.vertp, 1))
+                                fill!(icheck_sub, 0)
                                 for is in 1:poly0.nts
                                     for iv in 1:poly0.nipv[is]
                                         ip = poly0.ipv[is, iv]
@@ -1417,16 +1683,18 @@ function initf3d(func3d::F, poly::Polyhedron3D;
                                 elseif icontn_sub > 0 && icontp_sub > 0
                                     ntsini = poly0.nts
                                     # Truncate by the interface
-                                    iscut = zeros(Int, ns_max)
-                                    ipia0 = zeros(Int, nv_max)
-                                    ipia1 = zeros(Int, nv_max)
-                                    ntp_ref = Ref(poly0.ntp)
-                                    nts_ref = Ref(poly0.nts)
-                                    ntv_ref = Ref(poly0.ntv)
-                                    newpol3d!(ia, ipia0, ipia1, poly0.ipv, iscut,
-                                              poly0.nipv, ntp_ref, nts_ref, ntv_ref,
-                                              1.0, poly0.xns, 0.0, poly0.yns, 0.0, poly0.zns)
-                                    poly0.ntp = ntp_ref[]; poly0.nts = nts_ref[]; poly0.ntv = ntv_ref[]
+                                    fill!(iscut_sub, 0)
+                                    fill!(ipia0_sub, 0)
+                                    fill!(ipia1_sub, 0)
+                                    ntp_ref_sub[] = poly0.ntp
+                                    nts_ref_sub[] = poly0.nts
+                                    ntv_ref_sub[] = poly0.ntv
+                                    _newpol3d_impl!(ia, ipia0_sub, ipia1_sub, poly0.ipv, iscut_sub,
+                                                    poly0.nipv, ntp_ref_sub, nts_ref_sub, ntv_ref_sub,
+                                                    1.0, poly0.xns, 0.0, poly0.yns, 0.0, poly0.zns,
+                                                    ipv1_sub, nipv1_sub, nedge_sub, ise_sub,
+                                                    ivise_sub, ipise_sub, ipmark_sub)
+                                    poly0.ntp = ntp_ref_sub[]; poly0.nts = nts_ref_sub[]; poly0.ntv = ntv_ref_sub[]
 
                                     # Location of the new intersection points (multiple new faces)
                                     if poly0.nts > ntsini
@@ -1435,8 +1703,8 @@ function initf3d(func3d::F, poly::Polyhedron3D;
                                             sumx = 0.0; sumy = 0.0; sumz = 0.0
                                             for iv in 1:poly0.nipv[is]
                                                 ip  = poly0.ipv[is, iv]
-                                                ip0 = ipia0[ip]
-                                                ip1 = ipia1[ip]
+                                                ip0 = ipia0_sub[ip]
+                                                ip1 = ipia1_sub[ip]
                                                 poly0.vertp[ip, 1] = poly0.vertp[ip0, 1] -
                                                     phiv[ip0] * (poly0.vertp[ip1, 1] - poly0.vertp[ip0, 1]) /
                                                     (phiv[ip1] - phiv[ip0])

@@ -55,12 +55,10 @@ end
 Vertex indices arrangement of the truncated polygon (in-place).
 Returns updated `(ntp0, ntv0)`.
 """
-function newpol2d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
-                   ipv0::Vector{Int}, ntp0::Ref{Int}, ntv0::Ref{Int},
-                   vertp0::Matrix{Float64}, xncut::Vector{Float64},
-                   yncut::Vector{Float64})
-    nv_max = length(ipv0)
-    ipv1 = zeros(Int, nv_max)
+function _newpol2d_impl!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
+                         ipv0::Vector{Int}, ntp0::Ref{Int}, ntv0::Ref{Int},
+                         vertp0::Matrix{Float64}, xncut::Vector{Float64},
+                         yncut::Vector{Float64}, ipv1::Vector{Int})
     ntv1 = 0
     icut = 0
 
@@ -100,6 +98,53 @@ function newpol2d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
     return
 end
 
+function newpol2d!(ia::Vector{Int}, ipia0::Vector{Int}, ipia1::Vector{Int},
+                   ipv0::Vector{Int}, ntp0::Ref{Int}, ntv0::Ref{Int},
+                   vertp0::Matrix{Float64}, xncut::Vector{Float64},
+                   yncut::Vector{Float64})
+    ipv1 = zeros(Int, length(ipv0))
+    return _newpol2d_impl!(ia, ipia0, ipia1, ipv0, ntp0, ntv0, vertp0, xncut, yncut, ipv1)
+end
+
+mutable struct _Inte2DWork
+    ia::Vector{Int}
+    phiv::Vector{Float64}
+    ipia0::Vector{Int}
+    ipia1::Vector{Int}
+    xncut::Vector{Float64}
+    yncut::Vector{Float64}
+    ntp_ref::Base.RefValue{Int}
+    ntv_ref::Base.RefValue{Int}
+    ipv1::Vector{Int}
+end
+
+function _Inte2DWork(poly::Polygon2D)
+    nv_store = size(poly.vertp, 1)
+    nv_max = length(poly.ipv)
+    return _Inte2DWork(
+        zeros(Int, nv_store),
+        zeros(nv_store),
+        zeros(Int, 2),
+        zeros(Int, 2),
+        zeros(2),
+        zeros(2),
+        Ref(0),
+        Ref(0),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_inte2d_work(poly::Polygon2D)
+    key = (length(poly.ipv), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_inte2d_work) do
+        Dict{NTuple{2, Int}, _Inte2DWork}()
+    end::Dict{NTuple{2, Int}, _Inte2DWork}
+    return get!(cache, key) do
+        _Inte2DWork(poly)
+    end::_Inte2DWork
+end
+
 # ============================= INTE2D ======================================
 """
     inte2d!(poly::Polygon2D, c, xnc, ync) -> (icontn, icontp)
@@ -112,13 +157,21 @@ function inte2d!(poly::Polygon2D, c::Float64, xnc::Float64, ync::Float64)
     vertp0 = poly.vertp
     ntp0   = poly.ntp
     ntv0   = poly.ntv
-    nv_max = length(ipv0)
+    work = _get_inte2d_work(poly)::_Inte2DWork
+    ia = work.ia
+    phiv = work.phiv
+    ipia0 = work.ipia0
+    ipia1 = work.ipia1
+    xncut = work.xncut
+    yncut = work.yncut
+    ntp_ref = work.ntp_ref
+    ntv_ref = work.ntv_ref
+    ipv1 = work.ipv1
 
     icontp = 0; icontn = 0
     tolp = 1.0e-14
 
-    ia   = zeros(Int, size(vertp0, 1))
-    phiv = zeros(size(vertp0, 1))
+    fill!(ia, 0)
 
     for iv in 1:ntv0
         ip = ipv0[iv]
@@ -133,15 +186,15 @@ function inte2d!(poly::Polygon2D, c::Float64, xnc::Float64, ync::Float64)
     end
 
     if icontp != 0 && icontn != 0
-        ipia0 = zeros(Int, 2)
-        ipia1 = zeros(Int, 2)
-        xncut = zeros(2)
-        yncut = zeros(2)
-        ntp_ref = Ref(ntp0)
-        ntv_ref = Ref(ntv0)
+        fill!(ipia0, 0)
+        fill!(ipia1, 0)
+        fill!(xncut, 0.0)
+        fill!(yncut, 0.0)
+        ntp_ref[] = ntp0
+        ntv_ref[] = ntv0
 
-        newpol2d!(ia, ipia0, ipia1, ipv0, ntp_ref, ntv_ref,
-                  vertp0, xncut, yncut)
+        _newpol2d_impl!(ia, ipia0, ipia1, ipv0, ntp_ref, ntv_ref,
+                        vertp0, xncut, yncut, ipv1)
         ntp0 = ntp_ref[]; ntv0 = ntv_ref[]
 
         # Position of the new vertices
@@ -272,6 +325,66 @@ function enforv2dsz(dx::Float64, dy::Float64, v::Float64,
 end
 
 # ============================= ENFORV2D ====================================
+# Small in-place insertion sort to avoid closure allocations in hot paths.
+function _sort_listv_desc_by_phiv!(listv::Vector{Int}, phiv::Vector{Float64}, n::Int)
+    for i in 2:n
+        key = listv[i]
+        keyv = phiv[key]
+        j = i - 1
+        while j >= 1 && phiv[listv[j]] < keyv
+            listv[j + 1] = listv[j]
+            j -= 1
+        end
+        listv[j + 1] = key
+    end
+    return listv
+end
+
+mutable struct _Enforv2DWork
+    poly0::Polygon2D
+    poly1::Polygon2D
+    phiv::Vector{Float64}
+    ia::Vector{Int}
+    listv::Vector{Int}
+    ipia0::Vector{Int}
+    ipia1::Vector{Int}
+    xncut::Vector{Float64}
+    yncut::Vector{Float64}
+    ntp_ref::Base.RefValue{Int}
+    ntv_ref::Base.RefValue{Int}
+    ipv1::Vector{Int}
+end
+
+function _Enforv2DWork(poly::Polygon2D)
+    nv_store = size(poly.vertp, 1)
+    nv_max = length(poly.ipv)
+    return _Enforv2DWork(
+        cppol2d(poly),
+        cppol2d(poly),
+        zeros(nv_store),
+        zeros(Int, nv_store),
+        zeros(Int, nv_store),
+        zeros(Int, 2),
+        zeros(Int, 2),
+        zeros(2),
+        zeros(2),
+        Ref(0),
+        Ref(0),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_enforv2d_work(poly::Polygon2D)
+    key = (length(poly.ipv), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_enforv2d_work) do
+        Dict{NTuple{2, Int}, _Enforv2DWork}()
+    end::Dict{NTuple{2, Int}, _Enforv2DWork}
+    return get!(cache, key) do
+        _Enforv2DWork(poly)
+    end::_Enforv2DWork
+end
+
 """
     enforv2d!(poly::Polygon2D, v, vt, xnc, ync) -> c
 
@@ -283,7 +396,6 @@ function enforv2d!(poly::Polygon2D, v::Float64, vt::Float64,
     ipv   = poly.ipv
     vertp = poly.vertp
     ntp   = poly.ntp; ntv = poly.ntv
-    nv_max = length(ipv)
     tolc = 1.0e-12
 
     if ntp > ntv
@@ -291,17 +403,28 @@ function enforv2d!(poly::Polygon2D, v::Float64, vt::Float64,
         ntp = poly.ntp; ntv = poly.ntv
     end
 
+    work = _get_enforv2d_work(poly)::_Enforv2DWork
+    poly0 = work.poly0
+    phiv = work.phiv
+    ia = work.ia
+    listv = work.listv
+    ipia0 = work.ipia0
+    ipia1 = work.ipia1
+    xncut = work.xncut
+    yncut = work.yncut
+    ntp_ref = work.ntp_ref
+    ntv_ref = work.ntv_ref
+    ipv1 = work.ipv1
+
     vaux = v
 
     # Compute phi and ordered list
-    phiv = zeros(size(vertp, 1))
-    ia   = zeros(Int, size(vertp, 1))
+    fill!(ia, 0)
     for iv in 1:ntv
-        ia[iv] = 0
         phiv[iv] = xnc * vertp[iv, 1] + ync * vertp[iv, 2]
+        listv[iv] = iv
     end
-    listv = collect(1:ntv)
-    sort!(listv, by = i -> -phiv[i])
+    _sort_listv_desc_by_phiv!(listv, phiv, ntv)
 
     invert = 0
     xncor = xnc; yncor = ync
@@ -358,18 +481,21 @@ function enforv2d!(poly::Polygon2D, v::Float64, vt::Float64,
         end
 
         # Copy polygon to working copy
-        poly0 = cppol2d(poly)
+        cppol2d!(poly0, poly)
         ipv0 = poly0.ipv; vertp0 = poly0.vertp
         ntp0 = poly0.ntp; ntv0 = poly0.ntv
 
         # Construction of the new polygon
-        ipia0 = zeros(Int, 2); ipia1 = zeros(Int, 2)
-        xncut = zeros(2); yncut = zeros(2)
-        ntp_ref = Ref(ntp0); ntv_ref = Ref(ntv0)
+        fill!(ipia0, 0)
+        fill!(ipia1, 0)
+        fill!(xncut, 0.0)
+        fill!(yncut, 0.0)
+        ntp_ref[] = ntp0
+        ntv_ref[] = ntv0
 
         ntpini = ntp0
-        newpol2d!(ia, ipia0, ipia1, ipv0, ntp_ref, ntv_ref,
-                  vertp0, xncut, yncut)
+        _newpol2d_impl!(ia, ipia0, ipia1, ipv0, ntp_ref, ntv_ref,
+                        vertp0, xncut, yncut, ipv1)
         ntp0 = ntp_ref[]; ntv0 = ntv_ref[]
         # Zero out new vertex coordinates and ia flags (v3.2 fix)
         for ip in (ntpini + 1):ntp0
@@ -467,15 +593,59 @@ end
 """
     enforv2d(poly::Polygon2D, v, vt, xnc, ync) -> c
 
-Non-mutating version: copies `poly` first, then solves.
+Non-mutating version: uses a task-local scratch copy, then solves.
 """
 function enforv2d(poly::Polygon2D, v::Float64, vt::Float64,
                   xnc::Float64, ync::Float64)
-    p = cppol2d(poly)
-    return enforv2d!(p, v, vt, xnc, ync)
+    work = _get_enforv2d_work(poly)::_Enforv2DWork
+    cppol2d!(work.poly1, poly)
+    return enforv2d!(work.poly1, v, vt, xnc, ync)
 end
 
 # ============================= INITF2D =====================================
+mutable struct _Initf2DWork
+    phiv::Vector{Float64}
+    ia::Vector{Int}
+    poly2::Polygon2D
+    poly1::Polygon2D
+    ipia0::Vector{Int}
+    ipia1::Vector{Int}
+    xncut::Vector{Float64}
+    yncut::Vector{Float64}
+    ntp_ref::Base.RefValue{Int}
+    ntv_ref::Base.RefValue{Int}
+    ipv1::Vector{Int}
+end
+
+function _Initf2DWork(poly::Polygon2D)
+    nv_store = size(poly.vertp, 1)
+    nv_max = length(poly.ipv)
+    return _Initf2DWork(
+        zeros(nv_store),
+        zeros(Int, nv_store),
+        cppol2d(poly),
+        cppol2d(poly),
+        zeros(Int, nv_max),
+        zeros(Int, nv_max),
+        zeros(nv_max),
+        zeros(nv_max),
+        Ref(0),
+        Ref(0),
+        zeros(Int, nv_max),
+    )
+end
+
+function _get_initf2d_work(poly::Polygon2D)
+    key = (length(poly.ipv), size(poly.vertp, 1))
+    tls = task_local_storage()
+    cache = get!(tls, :_voftools_initf2d_work) do
+        Dict{NTuple{2, Int}, _Initf2DWork}()
+    end::Dict{NTuple{2, Int}, _Initf2DWork}
+    return get!(cache, key) do
+        _Initf2DWork(poly)
+    end::_Initf2DWork
+end
+
 """
     initf2d(func2d, poly::Polygon2D; nc::Int=10, tol::Float64=10.0) -> Float64
 
@@ -496,15 +666,15 @@ function initf2d(func2d::F, poly::Polygon2D;
     ipv   = poly.ipv
     vertp = poly.vertp
     ntp   = poly.ntp; ntv = poly.ntv
-    nv_max = length(ipv)
+    work = _get_initf2d_work(poly)::_Initf2DWork
 
     # Coordinate extremes and vertex tagging
     xmin = 1.0e20; xmax = -1.0e20
     ymin = 1.0e20; ymax = -1.0e20
     icontp = 0; icontn = 0
 
-    phiv = zeros(size(vertp, 1))
-    ia   = zeros(Int, size(vertp, 1))
+    phiv = work.phiv
+    ia = work.ia
 
     for iv in 1:ntv
         ip = ipv[iv]
@@ -542,10 +712,20 @@ function initf2d(func2d::F, poly::Polygon2D;
     ddx = dx / nc; ddy = dy / nc
 
     vf = 0.0
+    poly2 = work.poly2
+    poly1 = work.poly1
+    ipia0 = work.ipia0
+    ipia1 = work.ipia1
+    xncut = work.xncut
+    yncut = work.yncut
+    ntp_ref = work.ntp_ref
+    ntv_ref = work.ntv_ref
+    ipv1 = work.ipv1
+
     for ic in 1:nc
         xc = xmin + (ic - 1) * ddx
-        # Copy polygon → poly2
-        poly2 = cppol2d(poly)
+        # Copy polygon -> poly2
+        cppol2d!(poly2, poly)
         # Truncate by x-lines
         if ic > 1
             cx1 = -xc
@@ -556,8 +736,8 @@ function initf2d(func2d::F, poly::Polygon2D;
 
         for jc in 1:nc
             yc = ymin + (jc - 1) * ddy
-            # Copy poly2 → poly1
-            poly1 = cppol2d(poly2)
+            # Copy poly2 -> poly1
+            cppol2d!(poly1, poly2)
             if jc > 1
                 cy1 = -yc
                 icontn_y, icontp_y = inte2d!(poly1, cy1, 0.0, 1.0)
@@ -585,13 +765,14 @@ function initf2d(func2d::F, poly::Polygon2D;
                     elseif icontn_sub > 0 && icontp_sub > 0
                         ntpini = poly1.ntp
                         # Truncate by the interface using newpol2d!
-                        ipia0 = zeros(Int, nv_max)
-                        ipia1 = zeros(Int, nv_max)
-                        xncut = zeros(nv_max)
-                        yncut = zeros(nv_max)
-                        ntp_ref = Ref(poly1.ntp); ntv_ref = Ref(poly1.ntv)
-                        newpol2d!(ia, ipia0, ipia1, poly1.ipv, ntp_ref, ntv_ref,
-                                  poly1.vertp, xncut, yncut)
+                        fill!(ipia0, 0)
+                        fill!(ipia1, 0)
+                        fill!(xncut, 0.0)
+                        fill!(yncut, 0.0)
+                        ntp_ref[] = poly1.ntp
+                        ntv_ref[] = poly1.ntv
+                        _newpol2d_impl!(ia, ipia0, ipia1, poly1.ipv, ntp_ref, ntv_ref,
+                                        poly1.vertp, xncut, yncut, ipv1)
                         poly1.ntp = ntp_ref[]; poly1.ntv = ntv_ref[]
 
                         # Location of the new intersection points
