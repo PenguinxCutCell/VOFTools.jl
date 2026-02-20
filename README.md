@@ -1,5 +1,7 @@
 # VOFTools.jl
 
+![CI](https://github.com/PenguinxCutCell/VOFTools.jl/workflows/CI/badge.svg)
+
 A Julia translation of VOFTools (Version 5, January 2020) — analytical and
 geometrical tools for 2D/3D Volume-of-Fluid (VOF) methods on general convex
 and Cartesian grids.
