@@ -1510,12 +1510,20 @@ end
 function _get_initf3d_work(poly::Polyhedron3D)
     key = (size(poly.ipv, 1), size(poly.ipv, 2), size(poly.vertp, 1))
     tls = task_local_storage()
-    cache = get!(tls, :_voftools_initf3d_work) do
-        Dict{NTuple{3, Int}, _Initf3DWork}()
-    end::Dict{NTuple{3, Int}, _Initf3DWork}
-    return get!(cache, key) do
-        _Initf3DWork(poly)
-    end::_Initf3DWork
+    cache_any = get(tls, :_voftools_initf3d_work, nothing)
+    cache = if cache_any === nothing
+        c = Dict{NTuple{3, Int}, _Initf3DWork}()
+        tls[:_voftools_initf3d_work] = c
+        c
+    else
+        cache_any::Dict{NTuple{3, Int}, _Initf3DWork}
+    end
+    work = get(cache, key, nothing)
+    if work === nothing
+        work = _Initf3DWork(poly)
+        cache[key] = work
+    end
+    return work::_Initf3DWork
 end
 
 # ============================= INITF3D =====================================
@@ -1534,8 +1542,8 @@ Initialize the material volume fraction in a polyhedral cell.
 
 Returns the volume fraction `vf ∈ [0, 1]`.
 """
-function initf3d(func3d::F, poly::Polyhedron3D;
-                 nc::Int=10, tol::Float64=10.0) where {F}
+function initf3d(func3d::F, poly::Polyhedron3D,
+                 nc::Int, tol::Float64) where {F}
     ipv   = poly.ipv
     nipv  = poly.nipv
     vertp = poly.vertp
@@ -1770,4 +1778,9 @@ function initf3d(func3d::F, poly::Polyhedron3D;
     end
     vf /= volt
     return vf
+end
+
+@inline function initf3d(func3d::F, poly::Polyhedron3D;
+                         nc::Int=10, tol::Float64=10.0) where {F}
+    return initf3d(func3d, poly, nc, tol)
 end
