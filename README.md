@@ -1,10 +1,16 @@
 # VOFTools.jl
 
+[![Stable Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://penguinxcutcell.github.io/VOFTools.jl/stable)
+[![In development documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://penguinxcutcell.github.io/VOFTools.jl/dev)
 ![CI](https://github.com/PenguinxCutCell/VOFTools.jl/workflows/CI/badge.svg)
 
 A Julia translation of VOFTools (Version 5, January 2020) — analytical and
 geometrical tools for 2D/3D Volume-of-Fluid (VOF) methods on general convex
 and Cartesian grids.
+
+Documentation is built with Documenter.jl and published to:
+- Stable: `https://penguinxcutcell.github.io/VOFTools.jl/stable`
+- Dev: `https://penguinxcutcell.github.io/VOFTools.jl/dev`
 
 This repository contains:
 - `src/` — package source (core algorithms, mesh generators, utilities)

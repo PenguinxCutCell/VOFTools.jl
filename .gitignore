@@ -18,6 +18,7 @@
 *.so
 *.dylib
 *.a
+docs/build/
 
 # Package artifacts and temporary files
 artifacts/
