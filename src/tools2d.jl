@@ -636,11 +636,11 @@ function _Initf2DWork(poly::Polygon2D)
 end
 
 function _get_initf2d_work(poly::Polygon2D)
-    key = (length(poly.ipv), size(poly.vertp, 1))
+    key = objectid(poly)
     tls = task_local_storage()
     cache = get!(tls, :_voftools_initf2d_work) do
-        Dict{NTuple{2, Int}, _Initf2DWork}()
-    end::Dict{NTuple{2, Int}, _Initf2DWork}
+        Dict{UInt, _Initf2DWork}()
+    end::Dict{UInt, _Initf2DWork}
     return get!(cache, key) do
         _Initf2DWork(poly)
     end::_Initf2DWork
@@ -661,8 +661,8 @@ Initialize the material area fraction in a polygonal cell.
 
 Returns the area fraction `vf ∈ [0, 1]`.
 """
-function initf2d(func2d::F, poly::Polygon2D;
-                 nc::Int=10, tol::Float64=10.0) where {F}
+function initf2d(func2d::F, poly::Polygon2D,
+                 nc::Int, tol::Float64) where {F}
     ipv   = poly.ipv
     vertp = poly.vertp
     ntp   = poly.ntp; ntv = poly.ntv
@@ -795,4 +795,9 @@ function initf2d(func2d::F, poly::Polygon2D;
     end
     vf /= volt
     return vf
+end
+
+@inline function initf2d(func2d::F, poly::Polygon2D;
+                         nc::Int=10, tol::Float64=10.0) where {F}
+    return initf2d(func2d, poly, nc, tol)
 end

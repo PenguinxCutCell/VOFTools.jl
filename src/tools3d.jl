@@ -1508,15 +1508,15 @@ function _Initf3DWork(poly::Polyhedron3D)
 end
 
 function _get_initf3d_work(poly::Polyhedron3D)
-    key = (size(poly.ipv, 1), size(poly.ipv, 2), size(poly.vertp, 1))
+    key = objectid(poly)
     tls = task_local_storage()
     cache_any = get(tls, :_voftools_initf3d_work, nothing)
     cache = if cache_any === nothing
-        c = Dict{NTuple{3, Int}, _Initf3DWork}()
+        c = Dict{UInt, _Initf3DWork}()
         tls[:_voftools_initf3d_work] = c
         c
     else
-        cache_any::Dict{NTuple{3, Int}, _Initf3DWork}
+        cache_any::Dict{UInt, _Initf3DWork}
     end
     work = get(cache, key, nothing)
     if work === nothing
